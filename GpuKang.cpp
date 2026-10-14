@@ -43,6 +43,10 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	memset(SpeedStats, 0, sizeof(SpeedStats));
 	cur_stats_ind = 0;
 
+	RndPnts = NULL;
+	Kparams.HenryMode = HenryMode ? 1 : 0;
+	Kparams.HenryWild = HenryWild ? 1 : 0;
+
 	cudaError_t err;
 	err = cudaSetDevice(CudaIndex);
 	if (err != cudaSuccess)
@@ -52,6 +56,17 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	path[0] = 0;
 //	GetExeDir(path, 500);
 //	strcat(path, "/");
+	// henry: the worker runs with CWD in /dev/shm (rule 8), so the cubin is
+	// loaded from the executable's directory instead of the CWD.
+	if (HenryMode)
+	{
+		if (!GetExeDir(path, 400))
+		{
+			printf("GPU %d: cannot find the executable directory\n", CudaIndex);
+			return false;
+		}
+		strcat(path, "/");
+	}
 	if (Is5xxx)
 		strcat(path, "kernel_sm120.cubin");
 	else
@@ -725,7 +740,7 @@ int RCGpuKang::GetStatsSpeed()
 	return res / STATS_WND_SIZE;
 }
 
-void RCGpuKang::Asm_CallGpuKernelAB()
+bool RCGpuKang::Asm_CallGpuKernelAB()
 {
 	TCallKernelParams kp;
 
@@ -738,11 +753,246 @@ void RCGpuKang::Asm_CallGpuKernelAB()
 	kp.sharedSize = Kparams.KernelA_LDS_Size;
 	cudaMemset(((u8*)Kparams.L2) + 96 * Kparams.KangCnt, 0, Inv_DataSize);
 	if (!cc.CallKernel(kp))
+	{
 		fprintf(stderr, "KernelA failed!");
+		return false;
+	}
 
 	strcpy(kp.kernel_name, "KernelB");
 	kp.blockCnt = Kparams.BlockCnt;
 	kp.sharedSize = Kparams.KernelB_LDS_Size;
 	if (!cc.CallKernel(kp))
+	{
 		fprintf(stderr, "KernelB failed!");
+		return false;
+	}
+	return true;
+}
+//////////////////////////////////////////////////////////////////////////////
+// henry (fork k-vanio): the -henry mode drives one herd from the main thread.
+// The GPU state layout below is the v4's; nothing here changes the walk.
+
+static void HenryErr(char* err, int err_size, const char* what, cudaError_t e)
+{
+	snprintf(err, err_size, "%s: %s", what, cudaGetErrorString(e));
+}
+
+// dists3: KangCnt signed 192-bit start distances (two's complement, 3 limbs LE)
+// l1s2: BlockCnt*BLOCK_SIZE words; loop_table: KangCnt*MD_LEN words, both already
+// in the GPU layout (Henry.cpp maps them from/to the checkpoint records).
+// Places every kangaroo at the point of its distance with KernelGen: TAME d*G,
+// WILD d*G - Q' (d = 0: -Q'), negative d as -|d|*G. dists: KangCnt signed 192-bit
+// values, limbs LE, 'stride' u64 apart (3 = host array, 4 = the GPU dists copy).
+// Touches only L2 (points); dists, L1S2 and LoopTable are left alone.
+bool RCGpuKang::HenryPlacePoints(const u64* dists, int stride, char* err, int err_size)
+{
+	// Same L2 layout Start() fills before KernelGen: x | y | d, KangCnt entries
+	// each, indexed by kang_ind. x,y = -Q' for WILD (KernelGen adds d*G to it and
+	// keeps it as is when d = 0), zero for TAME. d = |d| with the sign in limb 3.
+	u64* gpu_pnts = (u64*)malloc(96 * (u64)KangCnt);
+	if (!gpu_pnts)
+	{
+		snprintf(err, err_size, "out of host memory");
+		return false;
+	}
+	u8 wild_buf[64];
+	PntWild.SaveToBuffer64(wild_buf);
+	for (int i = 0; i < KangCnt; i++)
+	{
+		u64* px = gpu_pnts + 4 * (u64)i;
+		u64* py = gpu_pnts + 4 * (u64)KangCnt + 4 * (u64)i;
+		u64* pd = gpu_pnts + 8 * (u64)KangCnt + 4 * (u64)i;
+		if (HenryWild)
+		{
+			memcpy(px, wild_buf, 32);
+			memcpy(py, wild_buf + 32, 32);
+		}
+		else
+		{
+			memset(px, 0, 32);
+			memset(py, 0, 32);
+		}
+		const u64* d = dists + (u64)stride * i;
+		bool neg = (d[2] >> 63) != 0;
+		if (neg)
+		{
+			// |d| = 2^192 - d (2^191 itself fits: limbs are unsigned)
+			u8 c = _subborrow_u64(0, 0, d[0], (unsigned long long*)&pd[0]);
+			c = _subborrow_u64(c, 0, d[1], (unsigned long long*)&pd[1]);
+			_subborrow_u64(c, 0, d[2], (unsigned long long*)&pd[2]);
+		}
+		else
+		{
+			pd[0] = d[0];
+			pd[1] = d[1];
+			pd[2] = d[2];
+		}
+		pd[3] = neg ? 1 : 0;
+	}
+	cudaError_t e = cudaMemcpy(Kparams.L2, gpu_pnts, 96 * (u64)KangCnt, cudaMemcpyHostToDevice);
+	free(gpu_pnts);
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "cudaMemcpy start points", e);
+		return false;
+	}
+	CallGpuKernelGen(Kparams);
+	e = cudaGetLastError();
+	if (e == cudaSuccess)
+		e = cudaDeviceSynchronize();
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "KernelGen", e);
+		return false;
+	}
+	return true;
+}
+
+// dists3: KangCnt signed 192-bit start distances (two's complement, 3 limbs LE)
+// l1s2: BlockCnt*BLOCK_SIZE words; loop_table: KangCnt*MD_LEN words, both already
+// in the GPU layout (Henry.cpp maps them from/to the checkpoint records).
+bool RCGpuKang::HenryStart(const u64* dists3, const u32* l1s2, const u64* loop_table, EcPoint _PntWild, char* err, int err_size)
+{
+	cudaError_t e = cudaSetDevice(CudaIndex);
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "cudaSetDevice", e);
+		return false;
+	}
+	PntWild = _PntWild;
+	if (!HenryPlacePoints(dists3, 3, err, err_size))
+		return false;
+	u64* d4 = (u64*)malloc(32 * (u64)KangCnt);
+	if (!d4)
+	{
+		snprintf(err, err_size, "out of host memory");
+		return false;
+	}
+	for (int i = 0; i < KangCnt; i++)
+	{
+		d4[4 * (u64)i + 0] = dists3[3 * (u64)i + 0];
+		d4[4 * (u64)i + 1] = dists3[3 * (u64)i + 1];
+		d4[4 * (u64)i + 2] = dists3[3 * (u64)i + 2];
+		d4[4 * (u64)i + 3] = 0;
+	}
+	e = cudaMemcpy(Kparams.dists, d4, 32 * (u64)KangCnt, cudaMemcpyHostToDevice);
+	free(d4);
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "cudaMemcpy dists", e);
+		return false;
+	}
+	e = cudaMemset(Kparams.L1S2, 0, mpCnt * Kparams.BlockSize * 8);
+	if (e == cudaSuccess)
+		e = cudaMemcpy(Kparams.L1S2, l1s2, sizeof(u32) * Kparams.BlockCnt * BLOCK_SIZE, cudaMemcpyHostToDevice);
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "cudaMemcpy L1S2", e);
+		return false;
+	}
+	e = cudaMemcpy(Kparams.LoopTable, loop_table, sizeof(u64) * MD_LEN * (u64)KangCnt, cudaMemcpyHostToDevice);
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "cudaMemcpy LoopTable", e);
+		return false;
+	}
+	e = cudaMemset(Kparams.dbg_buf, 0, 1024);
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "cudaMemset dbg_buf", e);
+		return false;
+	}
+	return true;
+}
+
+// One iteration (STEP_CNT jumps for every kangaroo), same kernel sequence as
+// Execute() minus the restarts. DPs are in GPU format (GPU_DP_SIZE bytes each:
+// x[0..1] | d[0..2] | kang_ind), in the host buffer *dps.
+bool RCGpuKang::HenryIterate(u32* dp_cnt, u32** dps, char* err, int err_size)
+{
+	cudaError_t e = cudaMemset(Kparams.DPs_out, 0, 4);
+	if (e == cudaSuccess)
+		e = cudaMemset(Kparams.DPTable, 0, KangCnt * sizeof(u32));
+	if (e == cudaSuccess)
+		e = cudaMemset(Kparams.LoopedKangs, 0, 8);
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "cudaMemset", e);
+		return false;
+	}
+	if (sm_inv_cnt) //use turbo asm kernels
+	{
+		if (!Asm_CallGpuKernelAB())
+		{
+			snprintf(err, err_size, "turbo kernel launch failed");
+			return false;
+		}
+	}
+	else
+	{
+		CallGpuKernelA(Kparams);
+		CallGpuKernelB(Kparams);
+	}
+	CallGpuKernelC(Kparams);
+	e = cudaGetLastError();
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "kernel launch", e);
+		return false;
+	}
+	u32 cnt = 0;
+	e = cudaMemcpy(&cnt, Kparams.DPs_out, 4, cudaMemcpyDeviceToHost);
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "iteration", e);
+		return false;
+	}
+	// BuildDP clamps the slot to MAX_DP_CNT-1 but keeps counting: above the
+	// limit DPs were overwritten. Losing DPs silently would lose paid work, so
+	// it is fatal here (raise dp) instead of the v4's warning.
+	if (cnt > MAX_DP_CNT)
+	{
+		snprintf(err, err_size, "GPU DP buffer overflow (%u DPs in one iteration, max %d): increase dp", cnt, MAX_DP_CNT);
+		return false;
+	}
+	if (cnt)
+	{
+		e = cudaMemcpy(DPs_out, Kparams.DPs_out + 4, cnt * GPU_DP_SIZE, cudaMemcpyDeviceToHost);
+		if (e != cudaSuccess)
+		{
+			HenryErr(err, err_size, "cudaMemcpy DPs", e);
+			return false;
+		}
+	}
+	*dp_cnt = cnt;
+	*dps = DPs_out;
+	return true;
+}
+
+// State at an iteration boundary, in the GPU layout: dists4 KangCnt*4 words,
+// l1s2 BlockCnt*BLOCK_SIZE words, loop_table KangCnt*MD_LEN words.
+bool RCGpuKang::HenryReadState(u64* dists4, u32* l1s2, u64* loop_table, char* err, int err_size)
+{
+	cudaError_t e = cudaMemcpy(dists4, Kparams.dists, 32 * (u64)KangCnt, cudaMemcpyDeviceToHost);
+	if (e == cudaSuccess)
+		e = cudaMemcpy(l1s2, Kparams.L1S2, sizeof(u32) * Kparams.BlockCnt * BLOCK_SIZE, cudaMemcpyDeviceToHost);
+	if (e == cudaSuccess)
+		e = cudaMemcpy(loop_table, Kparams.LoopTable, sizeof(u64) * MD_LEN * (u64)KangCnt, cudaMemcpyDeviceToHost);
+	if (e != cudaSuccess)
+	{
+		HenryErr(err, err_size, "read state", e);
+		return false;
+	}
+	return true;
+}
+
+// Current point of one kangaroo (L2: x at 4*kang_ind, y at 4*KangCnt + 4*kang_ind,
+// the layout KernelGen and KernelC use). Used for the start-point self-check.
+bool RCGpuKang::HenryReadPoint(int kang_ind, EcPoint* pnt)
+{
+	pnt->x.SetZero();
+	pnt->y.SetZero();
+	if (cudaMemcpy(pnt->x.data, Kparams.L2 + 4 * (u64)kang_ind, 32, cudaMemcpyDeviceToHost) != cudaSuccess)
+		return false;
+	return cudaMemcpy(pnt->y.data, Kparams.L2 + 4 * (u64)KangCnt + 4 * (u64)kang_ind, 32, cudaMemcpyDeviceToHost) == cudaSuccess;
 }

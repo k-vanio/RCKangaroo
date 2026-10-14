@@ -517,12 +517,18 @@ __global__ void KernelGen(const TKparams Kparams)
 		tx[0] = GX_0; tx[1] = GX_1; tx[2] = GX_2; tx[3] = GX_3;
 		ty[0] = GY_0; ty[1] = GY_1; ty[2] = GY_2; ty[3] = GY_3;
 
+		// henry: d[3] carries the sign of the start distance (the host puts |d| in
+		// d[0..2]). A restored checkpoint can hold a negative distance (jumps are
+		// subtracted when y is odd), whose point is -|d|*G. Original mode leaves
+		// d[3] uninitialized, so the flag is only read under HenryMode.
+		bool neg = Kparams.HenryMode && (d[3] != 0);
+
 		bool first = true;
 		int n = 2;
 		while ((n >= 0) && !d[n]) 
 			n--;
 		if (n < 0)
-			continue; //error
+			continue; //error (henry: WILD d = 0 stays at -Q' placed by the host; TAME d = 0 is refused by the host)
 		int index = __clzll(d[n]);
 		for (int i = 0; i <= 64 * n + (63 - index); i++)
 		{
@@ -547,13 +553,20 @@ __global__ void KernelGen(const TKparams Kparams)
 			Copy_u64_x4(ty, t2y);
 		}
 
-		if (!Kparams.IsGenMode)
-			if (kang_ind >= Kparams.KangCnt / 3)
-			{
-				AddPoints(t2x, t2y, x, y, x0, y0);
-				Copy_u64_x4(x, t2x);
-				Copy_u64_x4(y, t2y);
-			}
+		if (neg)
+			NegModP(y);
+
+		bool wild;
+		if (Kparams.HenryMode)
+			wild = (Kparams.HenryWild != 0); // one type per herd: the worker never holds both sides of a collision
+		else
+			wild = !Kparams.IsGenMode && (kang_ind >= Kparams.KangCnt / 3);
+		if (wild)
+		{
+			AddPoints(t2x, t2y, x, y, x0, y0);
+			Copy_u64_x4(x, t2x);
+			Copy_u64_x4(y, t2y);
+		}
 
 		SAVE_VAL_256(L2x, x, group)
 		SAVE_VAL_256(L2y, y, group)

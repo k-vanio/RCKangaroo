@@ -64,7 +64,7 @@ private:
 #endif
 
 	TCubinCall cc;
-	void Asm_CallGpuKernelAB();
+	bool Asm_CallGpuKernelAB();
 public:
 	int persistingL2CacheMaxSize;
 	int CudaIndex; //gpu index in cuda
@@ -85,4 +85,16 @@ public:
 	u32 dbg[256];
 
 	int GetStatsSpeed();
+
+	// henry (fork k-vanio): one herd, driven by HenryMain (Henry.cpp) from the
+	// main thread; no DP database, no collision, no restart, no file.
+	bool HenryMode = false; //set before Prepare
+	bool HenryWild = false; //set before Prepare: the whole herd is WILD (else TAME)
+	int GetBlockCnt() { return (int)Kparams.BlockCnt; }
+	bool HenryPlacePoints(const u64* dists, int stride, char* err, int err_size);
+	bool HenryStart(const u64* dists3, const u32* l1s2, const u64* loop_table, EcPoint _PntWild, char* err, int err_size);
+	bool HenryIterate(u32* dp_cnt, u32** dps, char* err, int err_size);
+	bool HenryReadState(u64* dists4, u32* l1s2, u64* loop_table, char* err, int err_size);
+	bool HenryReadPoint(int kang_ind, EcPoint* pnt);
+	void HenryRelease() { Release(); }
 };

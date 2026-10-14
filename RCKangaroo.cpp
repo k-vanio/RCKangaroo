@@ -13,6 +13,7 @@
 #include "defs.h"
 #include "utils.h"
 #include "GpuKang.h"
+#include "Henry.h"
 
 
 EcJMP EcJumps1[JMP_CNT];
@@ -323,6 +324,50 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	printf("%sSpeed: %d MKeys/s, Err: %d, DPs: %lluK/%lluK, Time: %llud:%02dh:%02dm/%llud:%02dh:%02dm\r\n", gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: "), speed, gTotalErrors, db.GetBlockCnt()/1000, est_dps_cnt/1000, days, hours, min, exp_days, exp_hours, exp_min);
 }
 
+// Jump tables of the v4: table i holds JMP_CNT even distances, uniform in
+// [2^e_i, 2^(e_i+1)), drawn from mt19937_64 seeded with 0 in the order J1, J2, J3.
+// The v4 uses e = (R/2+3, R-10, R-12); -henry takes the exponents from the job
+// (rule 15: every worker of a job must build the same tables), and only the
+// ShiftLeft arguments change, so the draw order stays identical to the v4.
+// Leaves the generator seeded with 0 + consumed draws; the caller reseeds.
+void GenerateJumpTables(int e1, int e2, int e3)
+{
+	SetRndSeed(0); //use same seed to make tames from file compatible
+	EcInt minjump, t;
+	minjump.Set(1);
+	minjump.ShiftLeft(e1);
+	for (int i = 0; i < JMP_CNT; i++)
+	{
+		EcJumps1[i].dist = minjump;
+		t.RndMax(minjump);
+		EcJumps1[i].dist.Add(t);
+		EcJumps1[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
+		EcJumps1[i].p = ec.MultiplyG(EcJumps1[i].dist);
+	}
+
+	minjump.Set(1);
+	minjump.ShiftLeft(e2); //large jumps for L1S2 loops. Must be almost RANGE_BITS
+	for (int i = 0; i < JMP_CNT; i++)
+	{
+		EcJumps2[i].dist = minjump;
+		t.RndMax(minjump);
+		EcJumps2[i].dist.Add(t);
+		EcJumps2[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
+		EcJumps2[i].p = ec.MultiplyG(EcJumps2[i].dist);
+	}
+
+	minjump.Set(1);
+	minjump.ShiftLeft(e3); //large jumps for loops >2
+	for (int i = 0; i < JMP_CNT; i++)
+	{
+		EcJumps3[i].dist = minjump;
+		t.RndMax(minjump);
+		EcJumps3[i].dist.Add(t);
+		EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
+		EcJumps3[i].p = ec.MultiplyG(EcJumps3[i].dist);
+	}
+}
+
 bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 {
 	if ((Range < 32) || (Range > 180))
@@ -385,43 +430,10 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 			printf("tames loading failed\r\n");
 	}
 
-	SetRndSeed(0); //use same seed to make tames from file compatible
 	PntTotalOps = 0;
 	PntIndex = 0;
 //prepare jumps
-	EcInt minjump, t;
-	minjump.Set(1);
-	minjump.ShiftLeft(Range / 2 + 3);
-	for (int i = 0; i < JMP_CNT; i++)
-	{
-		EcJumps1[i].dist = minjump;
-		t.RndMax(minjump);
-		EcJumps1[i].dist.Add(t);
-		EcJumps1[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
-		EcJumps1[i].p = ec.MultiplyG(EcJumps1[i].dist);
-	}
-
-	minjump.Set(1);
-	minjump.ShiftLeft(Range - 10); //large jumps for L1S2 loops. Must be almost RANGE_BITS
-	for (int i = 0; i < JMP_CNT; i++)
-	{
-		EcJumps2[i].dist = minjump;
-		t.RndMax(minjump);
-		EcJumps2[i].dist.Add(t);
-		EcJumps2[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
-		EcJumps2[i].p = ec.MultiplyG(EcJumps2[i].dist);
-	}
-
-	minjump.Set(1);
-	minjump.ShiftLeft(Range - 10 - 2); //large jumps for loops >2
-	for (int i = 0; i < JMP_CNT; i++)
-	{
-		EcJumps3[i].dist = minjump;
-		t.RndMax(minjump);
-		EcJumps3[i].dist.Add(t);
-		EcJumps3[i].dist.data[0] &= 0xFFFFFFFFFFFFFFFE; //must be even
-		EcJumps3[i].p = ec.MultiplyG(EcJumps3[i].dist);
-	}
+	GenerateJumpTables(Range / 2 + 3, Range - 10, Range - 10 - 2);
 	SetRndSeed(GetTickCount64());
 
 	Int_HalfRange.Set(1);
@@ -631,6 +643,11 @@ bool ParseCommandLine(int argc, char* argv[])
 
 int main(int argc, char* argv[])
 {
+	// henry (fork k-vanio): the distributed mode speaks a binary protocol on
+	// stdout, so it branches off before the banner below is printed.
+	if (IsHenryInvocation(argc, argv))
+		return HenryMain(argc, argv);
+
 #ifdef _DEBUG	
 	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
 #endif

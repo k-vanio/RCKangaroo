@@ -86,5 +86,10 @@ struct TKparams
 	u32 KernelA_LDS_Size;
 	u32 KernelB_LDS_Size;
 	u32 KernelC_LDS_Size;
+	// henry (fork k-vanio): fields only APPENDED here. The turbo kernels in
+	// kernel_sm*.cubin read the fields above by fixed offsets (c[0x0][0x160..]),
+	// so nothing above may move. Only KernelGen (CUDA, RCGpuCore.cu) reads these.
+	u32 HenryMode; // 1 = -henry: one kangaroo type for the whole herd, signed start distances
+	u32 HenryWild; // -henry: 1 = every kangaroo is WILD, 0 = every kangaroo is TAME
 };
 
